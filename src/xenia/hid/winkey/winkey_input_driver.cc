@@ -1043,6 +1043,10 @@ void WinKeyInputDriver::OnRawMouse(ui::MouseEvent& evt) {
   mouse.wheel_delta = evt.scroll_y();
   mouse_events_.push(mouse);
 
+  if (window()->HasFocus()) {
+    AddRawMouseMotion(mouse.x_delta, mouse.y_delta);
+  }
+
   {
     if (mouse.buttons & RI_MOUSE_LEFT_BUTTON_DOWN) {
       key_states_[VK_LBUTTON] = true;

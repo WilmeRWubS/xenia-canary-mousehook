@@ -16,6 +16,8 @@
 #include <cmath>
 #include <map>
 #include <mutex>
+#include <utility>
+#include <vector>
 
 #include "xenia/base/platform_win.h"
 #include "xenia/emulator.h"
@@ -31,64 +33,84 @@ DECLARE_double(fov_sensitivity);
 DECLARE_bool(invert_y);
 DECLARE_bool(invert_x);
 
+DEFINE_bool(ge_reloaded_aim_assist, false,
+            "(GoldenEye 007 Reloaded) Keep the game's controller aim assist "
+            "(aim snap, lock-on and target tracking) while using the mouse",
+            "MouseHook");
+
 const uint32_t kTitleIdGoldenEyeReloaded = 0x415608AF;
 
 namespace xe {
 namespace hid {
 namespace winkey {
 
-// Mouse look works the same way as the GoldenEye 007: Reloaded static
-// recompilation (github.com/nikolaygorb/GoldenEye007ReloadedRecomp): the
-// mouse turn is injected into the player look update after the game's stick
-// processing, so there's no dead zone, response curve or turn speed cap.
+// Mouse look is injected into the player look update after the game's stick
+// processing, so there's no dead zone, response curve or turn speed cap (hook
+// points from github.com/nikolaygorb/GoldenEye007ReloadedRecomp). Mouse motion
+// is taken straight from raw input at each look update, so every update turns
+// the camera by exactly the motion since the previous one, 1:1 at any
+// framerate.
 namespace {
 
 struct ReloadedBuildAddrs {
-  uint32_t check_addr;   // instruction to check
-  uint32_t check_value;  // expected instruction at check_addr
+  // Instructions that must match, one per hook point.
+  std::vector<std::pair<uint32_t, uint32_t>> checks;
 
   // lbz r11,2618(r31): aim lock / snap checks, the look update returns right
   // after while either is set.
   uint32_t aim_assist_hook_addr;
   // Right after the aim friction call: r1+104 holds the yaw rate (rad/s).
   uint32_t yaw_hook_addr;
+  // Right after the aim tracking call: r1+96 holds its yaw correction.
+  uint32_t tracking_hook_addr;
   // The pitch clamp every look update path ends in (r31+2140 is loaded).
   uint32_t pitch_hook_addr;
-
-  uint32_t unzoomed_fov_addr;  // float, radians
 };
 
 const std::map<GoldenEyeReloadedGame::GameBuild, ReloadedBuildAddrs>
     kSupportedBuilds = {
         {GoldenEyeReloadedGame::GameBuild::GoldenEyeReloaded_Retail,
-         {0x821FDD00, 0x897F0A3A, 0x821FDD00, 0x821FDD64, 0x821FDEE4,
-          0x827F2854}},
+         {{{0x821FDD00, 0x897F0A3A},
+           {0x821FDD64, 0x39610068},
+           {0x821FDD84, 0x39410080},
+           {0x821FDEE4, 0xC01F085C}},
+          0x821FDD00,
+          0x821FDD64,
+          0x821FDD84,
+          0x821FDEE4}},
 };
 
 // Offsets into the player struct (r31 in the look update).
-constexpr uint32_t kPlayerDeltaTime = 428;  // float, seconds
-constexpr uint32_t kPlayerPitch = 2140;     // float, radians, + = look down
-constexpr uint32_t kPlayerFov = 2576;       // float, radians
-constexpr uint32_t kPlayerAimLock = 2618;   // uint8
+constexpr uint32_t kPlayerDeltaTime = 428;       // float, seconds
+constexpr uint32_t kPlayerPitch = 2140;          // float, radians, + = down
+constexpr uint32_t kPlayerAiming = 2242;         // uint8, aim button held
+constexpr uint32_t kPlayerFov = 2576;            // float, radians
+constexpr uint32_t kPlayerAimLock = 2618;        // uint8
 constexpr uint32_t kPlayerAimLockCached = 2661;  // uint8
 constexpr uint32_t kPlayerAimSnap = 2662;        // uint8
-constexpr uint32_t kStackYawRate = 104;  // float on r1, rad/s, + = right
+// Offsets into the look update's stack frame (r1).
+constexpr uint32_t kStackTrackingYaw = 96;  // float
+constexpr uint32_t kStackYawRate = 104;     // float, rad/s, + = right
 
 // Same scale as the Call of Duty hooks: degrees per mouse count at
 // sensitivity 1.
 constexpr double kCountsPerDegree = 10.5;
-// Mouse motion (|dx| + |dy|) that cancels an aim snap / lock.
+// Mouse motion (|dx| + |dy|) that cancels an aim snap / lock when aim assist
+// is kept.
 constexpr double kSnapCancelCounts = 4.0;
 // Guards against a stalled frame turning into one huge snap.
 constexpr double kMaxRadiansPerUpdate = 1.5;
 // If the look update hasn't run for this long we're in a menu / cutscene /
-// vehicle; mouse motion is dropped instead of piling up.
+// vehicle; motion from then is dropped instead of turning the camera later.
 constexpr std::chrono::milliseconds kLookUpdateTimeout{300};
 
 std::mutex mouse_mutex_;
 double pending_dx_ = 0.0;
 double pending_dy_ = 0.0;
 std::chrono::steady_clock::time_point last_look_update_{};
+
+// FOV while not aiming, zoom sensitivity is relative to it.
+double hip_fov_ = 0.0;
 
 // Pitch taken by the yaw hook, applied by the pitch hook of the same update.
 thread_local double pending_pitch_ = 0.0;
@@ -104,28 +126,55 @@ void StoreFloat(uint32_t address, float value) {
   *kernel_memory()->TranslateVirtual<xe::be<float>*>(address) = value;
 }
 
+uint8_t* BytePtr(uint32_t address) {
+  return kernel_memory()->TranslateVirtual<uint8_t*>(address);
+}
+
 bool HookActive() {
   return active_build_ &&
          kernel_state()->title_id() == kTitleIdGoldenEyeReloaded;
 }
 
-void MarkLookUpdate() {
+// Moves raw mouse motion into the pending turn, called at the start of each
+// look update.
+void CollectMouseMotion() {
+  int64_t dx, dy;
+  TakeRawMouseMotion(dx, dy);
+
   std::lock_guard<std::mutex> lock(mouse_mutex_);
-  last_look_update_ = std::chrono::steady_clock::now();
+  const auto now = std::chrono::steady_clock::now();
+  if (now - last_look_update_ > kLookUpdateTimeout) {
+    pending_dx_ = pending_dy_ = 0.0;
+  } else {
+    pending_dx_ += static_cast<double>(dx);
+    pending_dy_ += static_cast<double>(dy);
+  }
+  last_look_update_ = now;
+}
+
+float WrapAngle(double angle) {
+  return static_cast<float>(std::remainder(angle, 2.0 * M_PI));
 }
 
 bool PlausibleFov(double fov) {
   return std::isfinite(fov) && fov > 0.02 && fov < 3.0;
 }
 
-// Lowers sensitivity while zoomed, like cg_fovscale in the COD hooks.
+// 1 when not aiming; while aiming through a zoomed scope, scales by how much
+// the view is zoomed in, like cg_fovscale in the COD hooks.
 double ZoomScale(uint32_t player) {
   const double fov = LoadFloat(player + kPlayerFov);
-  const double unzoomed = LoadFloat(active_build_->unzoomed_fov_addr);
-  if (!PlausibleFov(fov) || !PlausibleFov(unzoomed)) {
+  if (!PlausibleFov(fov)) {
     return 1.0;
   }
-  double scale = std::tan(fov * 0.5) / std::tan(unzoomed * 0.5);
+  if (!*BytePtr(player + kPlayerAiming)) {
+    hip_fov_ = fov;
+    return 1.0;
+  }
+  if (!PlausibleFov(hip_fov_)) {
+    return 1.0;
+  }
+  double scale = std::tan(fov * 0.5) / std::tan(hip_fov_ * 0.5);
   if (scale >= 0.999) {
     return 1.0;
   }
@@ -138,27 +187,24 @@ void AimAssistHook(PPCContext* context, void* arg0, void* arg1) {
   if (!HookActive()) {
     return;
   }
-  MarkLookUpdate();
+  CollectMouseMotion();
 
   const uint32_t player = static_cast<uint32_t>(context->r[31]);
-  uint8_t* lock =
-      kernel_memory()->TranslateVirtual<uint8_t*>(player + kPlayerAimLock);
-  uint8_t* snap =
-      kernel_memory()->TranslateVirtual<uint8_t*>(player + kPlayerAimSnap);
+  uint8_t* lock = BytePtr(player + kPlayerAimLock);
+  uint8_t* snap = BytePtr(player + kPlayerAimSnap);
   if (!*lock && !*snap) {
     return;
   }
 
-  double moved;
-  {
+  bool cancel = !cvars::ge_reloaded_aim_assist;
+  if (!cancel) {
+    // Moving the mouse ends the aim snap / lock, as moving the stick does.
     std::lock_guard<std::mutex> guard(mouse_mutex_);
-    moved = std::abs(pending_dx_) + std::abs(pending_dy_);
+    cancel = std::abs(pending_dx_) + std::abs(pending_dy_) >= kSnapCancelCounts;
   }
-  // Moving the mouse ends the aim snap / lock, as moving the stick does.
-  if (moved >= kSnapCancelCounts) {
+  if (cancel) {
     *lock = 0;
-    *kernel_memory()->TranslateVirtual<uint8_t*>(player +
-                                                 kPlayerAimLockCached) = 0;
+    *BytePtr(player + kPlayerAimLockCached) = 0;
     *snap = 0;
   }
 }
@@ -168,27 +214,25 @@ void YawHook(PPCContext* context, void* arg0, void* arg1) {
   if (!HookActive()) {
     return;
   }
-
-  const uint32_t player = static_cast<uint32_t>(context->r[31]);
-  const double dt = LoadFloat(player + kPlayerDeltaTime);
+  CollectMouseMotion();
 
   double dx, dy;
   {
     std::lock_guard<std::mutex> lock(mouse_mutex_);
-    last_look_update_ = std::chrono::steady_clock::now();
-    if (!(dt > 1e-4 && dt < 0.5)) {
-      return;  // keep the motion for the next update
-    }
     dx = pending_dx_;
     dy = pending_dy_;
     pending_dx_ = pending_dy_ = 0.0;
   }
-  if (dx == 0.0 && dy == 0.0) {
-    return;
+
+  const uint32_t player = static_cast<uint32_t>(context->r[31]);
+  const double zoom = ZoomScale(player);
+  const double dt = LoadFloat(player + kPlayerDeltaTime);
+  if (!(dt > 1e-4 && dt < 0.5) || (dx == 0.0 && dy == 0.0)) {
+    return;  // paused / stalled frame, or nothing to do
   }
 
-  const double radians_per_count = (cvars::sensitivity / kCountsPerDegree) *
-                                   (M_PI / 180.0) * ZoomScale(player);
+  const double radians_per_count =
+      (cvars::sensitivity / kCountsPerDegree) * (M_PI / 180.0) * zoom;
   double yaw = dx * radians_per_count * (cvars::invert_x ? -1.0 : 1.0);
   double pitch = dy * radians_per_count * (cvars::invert_y ? -1.0 : 1.0);
   if (!std::isfinite(yaw) || !std::isfinite(pitch)) {
@@ -197,13 +241,21 @@ void YawHook(PPCContext* context, void* arg0, void* arg1) {
   yaw = std::clamp(yaw, -kMaxRadiansPerUpdate, kMaxRadiansPerUpdate);
   pitch = std::clamp(pitch, -kMaxRadiansPerUpdate, kMaxRadiansPerUpdate);
 
+  // The game turns by the yaw rate times the frame time.
   const uint32_t rate_address =
       static_cast<uint32_t>(context->r[1]) + kStackYawRate;
   StoreFloat(rate_address,
              LoadFloat(rate_address) + static_cast<float>(yaw / dt));
-
   pending_pitch_ = pitch;
   pitch_pending_ = true;
+}
+
+void TrackingHook(PPCContext* context, void* arg0, void* arg1) {
+  if (!HookActive() || cvars::ge_reloaded_aim_assist) {
+    return;
+  }
+  // Drop the aim assist's turn towards the tracked target.
+  StoreFloat(static_cast<uint32_t>(context->r[1]) + kStackTrackingYaw, 0.0f);
 }
 
 void PitchHook(PPCContext* context, void* arg0, void* arg1) {
@@ -214,7 +266,8 @@ void PitchHook(PPCContext* context, void* arg0, void* arg1) {
   if (!HookActive()) {
     return;
   }
-  const uint32_t address = static_cast<uint32_t>(context->r[31]) + kPlayerPitch;
+  const uint32_t player = static_cast<uint32_t>(context->r[31]);
+  const uint32_t address = player + kPlayerPitch;
   StoreFloat(address, LoadFloat(address) + static_cast<float>(pending_pitch_));
 }
 
@@ -232,9 +285,13 @@ bool GoldenEyeReloadedGame::IsGameSupported(GameVersion title_version) {
   }
 
   for (auto& build : kSupportedBuilds) {
-    auto* check = kernel_memory()->TranslateVirtual<xe::be<uint32_t>*>(
-        build.second.check_addr);
-    if (*check == build.second.check_value) {
+    const bool matches = std::all_of(
+        build.second.checks.begin(), build.second.checks.end(),
+        [](const std::pair<uint32_t, uint32_t>& check) {
+          return *kernel_memory()->TranslateVirtual<xe::be<uint32_t>*>(
+                     check.first) == check.second;
+        });
+    if (matches) {
       game_build_ = build.first;
       return true;
     }
@@ -252,20 +309,8 @@ bool GoldenEyeReloadedGame::IsGameSupported(GameVersion title_version) {
 bool GoldenEyeReloadedGame::DoHooks(uint32_t user_index,
                                     RawInputState& input_state,
                                     X_INPUT_STATE* out_state) {
-  if (!input_state.mouse.x_delta && !input_state.mouse.y_delta) {
-    return false;
-  }
-
-  std::lock_guard<std::mutex> lock(mouse_mutex_);
-  if (std::chrono::steady_clock::now() - last_look_update_ >
-      kLookUpdateTimeout) {
-    // Not in gameplay, don't let motion pile up for when we get back in.
-    pending_dx_ = pending_dy_ = 0.0;
-    return false;
-  }
-  pending_dx_ += input_state.mouse.x_delta;
-  pending_dy_ += input_state.mouse.y_delta;
-  return true;
+  // Mouse motion is taken from raw input by the look update hooks.
+  return false;
 }
 
 std::string GoldenEyeReloadedGame::ChooseBinds() { return "Default"; }
@@ -290,6 +335,8 @@ void GoldenEyeReloadedGame::MidHookInit() {
   xe::cpu::ppc::RegisterMidHookASM(active_build_->aim_assist_hook_addr,
                                    AimAssistHook);
   xe::cpu::ppc::RegisterMidHookASM(active_build_->yaw_hook_addr, YawHook);
+  xe::cpu::ppc::RegisterMidHookASM(active_build_->tracking_hook_addr,
+                                   TrackingHook);
   xe::cpu::ppc::RegisterMidHookASM(active_build_->pitch_hook_addr, PitchHook);
 
   midhook_status = HOOKED;
