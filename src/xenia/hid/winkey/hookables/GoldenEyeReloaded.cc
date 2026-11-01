@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <map>
 #include <mutex>
@@ -37,6 +38,11 @@ DEFINE_bool(ge_reloaded_aim_assist, false,
             "(GoldenEye 007 Reloaded) Keep the game's controller aim assist "
             "(aim snap, lock-on and target tracking) while using the mouse",
             "MouseHook");
+
+DEFINE_double(ge_reloaded_vehicle_sensitivity, 1.0,
+              "(GoldenEye 007 Reloaded) Mouse sensitivity in vehicles (e.g. "
+              "the Dam truck), where the mouse moves the right stick",
+              "MouseHook");
 
 const uint32_t kTitleIdGoldenEyeReloaded = 0x415608AF;
 
@@ -103,6 +109,14 @@ constexpr double kMaxRadiansPerUpdate = 1.5;
 // If the look update hasn't run for this long we're in a menu / cutscene /
 // vehicle; motion from then is dropped instead of turning the camera later.
 constexpr std::chrono::milliseconds kLookUpdateTimeout{300};
+// If the on-foot look update hasn't run for this long, the camera is driven
+// by something else (vehicles such as the Dam truck), which reads the right
+// stick, so the mouse moves the right stick instead.
+constexpr std::chrono::milliseconds kStickFallbackDelay{100};
+// Right stick emulation: deflection just past the game's dead zone, plus
+// deflection per mouse count in one controller poll.
+constexpr double kStickDeadZone = 0.27;
+constexpr double kStickPerCount = 0.03;
 
 std::mutex mouse_mutex_;
 double pending_dx_ = 0.0;
@@ -309,8 +323,38 @@ bool GoldenEyeReloadedGame::IsGameSupported(GameVersion title_version) {
 bool GoldenEyeReloadedGame::DoHooks(uint32_t user_index,
                                     RawInputState& input_state,
                                     X_INPUT_STATE* out_state) {
-  // Mouse motion is taken from raw input by the look update hooks.
-  return false;
+  // On foot, mouse motion is taken from raw input by the look update hooks.
+  {
+    std::lock_guard<std::mutex> lock(mouse_mutex_);
+    if (std::chrono::steady_clock::now() - last_look_update_ <
+        kStickFallbackDelay) {
+      return false;
+    }
+  }
+
+  const int32_t dx = input_state.mouse.x_delta;
+  const int32_t dy = input_state.mouse.y_delta;
+  if (!dx && !dy) {
+    return false;
+  }
+
+  auto to_stick = [](int32_t counts) -> int16_t {
+    if (!counts) {
+      return 0;
+    }
+    const double magnitude = std::min(
+        1.0, kStickDeadZone + std::abs(counts) * kStickPerCount *
+                                  cvars::ge_reloaded_vehicle_sensitivity);
+    return static_cast<int16_t>(std::copysign(magnitude, counts) * SHRT_MAX);
+  };
+  // Mouse right = stick right, mouse down = stick down (look down).
+  if (dx) {
+    out_state->gamepad.thumb_rx = to_stick(cvars::invert_x ? -dx : dx);
+  }
+  if (dy) {
+    out_state->gamepad.thumb_ry = to_stick(cvars::invert_y ? dy : -dy);
+  }
+  return true;
 }
 
 std::string GoldenEyeReloadedGame::ChooseBinds() { return "Default"; }
